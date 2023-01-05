@@ -428,6 +428,8 @@ class PROTOBUF_EXPORT Descriptor : private internal::SymbolBase {
     // See Descriptor::CopyTo().
     void CopyTo(DescriptorProto_ExtensionRange* proto) const;
 
+    const ExtensionRangeOptions& options() const;
+
     int start;  // inclusive
     int end;    // exclusive
 
@@ -2354,6 +2356,9 @@ PROTOBUF_DEFINE_ARRAY_ACCESSOR(FileDescriptor, service,
                                const ServiceDescriptor*)
 PROTOBUF_DEFINE_ARRAY_ACCESSOR(FileDescriptor, extension,
                                const FieldDescriptor*)
+
+PROTOBUF_DEFINE_OPTIONS_ACCESSOR(Descriptor::ExtensionRange,
+                                 ExtensionRangeOptions)
 
 #undef PROTOBUF_DEFINE_ACCESSOR
 #undef PROTOBUF_DEFINE_STRING_ACCESSOR

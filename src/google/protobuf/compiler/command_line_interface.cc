@@ -34,6 +34,7 @@
 
 #include "google/protobuf/compiler/command_line_interface.h"
 
+#include "absl/algorithm/container.h"
 #include "absl/container/btree_set.h"
 #include "absl/container/flat_hash_map.h"
 #include "google/protobuf/compiler/allowlists/allowlists.h"
@@ -1028,7 +1029,20 @@ struct VisitImpl {
   Visitor visitor;
   void Visit(const FieldDescriptor* descriptor) { visitor(descriptor); }
 
-  void Visit(const EnumDescriptor* descriptor) { visitor(descriptor); }
+  void Visit(const EnumValueDescriptor* descriptor) { visitor(descriptor); }
+
+  void Visit(const EnumDescriptor* descriptor) {
+    visitor(descriptor);
+    for (int i = 0; i < descriptor->value_count(); i++) {
+      visitor(descriptor->value(i));
+    }
+  }
+
+  void Visit(const Descriptor::ExtensionRange* descriptor) {
+    visitor(descriptor);
+  }
+
+  void Visit(const OneofDescriptor* descriptor) { visitor(descriptor); }
 
   void Visit(const Descriptor* descriptor) {
     visitor(descriptor);
@@ -1048,6 +1062,23 @@ struct VisitImpl {
     for (int i = 0; i < descriptor->extension_count(); i++) {
       Visit(descriptor->extension(i));
     }
+
+    for (int i = 0; i < descriptor->extension_range_count(); i++) {
+      Visit(descriptor->extension_range(i));
+    }
+
+    for (int i = 0; i < descriptor->oneof_decl_count(); i++) {
+      Visit(descriptor->oneof_decl(i));
+    }
+  }
+
+  void Visit(const MethodDescriptor* method) { visitor(method); }
+
+  void Visit(const ServiceDescriptor* descriptor) {
+    visitor(descriptor);
+    for (int i = 0; i < descriptor->method_count(); i++) {
+      visitor(descriptor->method(i));
+    }
   }
 
   void Visit(const std::vector<const FileDescriptor*>& descriptors) {
@@ -1062,6 +1093,9 @@ struct VisitImpl {
       for (int i = 0; i < descriptor->extension_count(); i++) {
         Visit(descriptor->extension(i));
       }
+      for (int i = 0; i < descriptor->service_count(); i++) {
+        Visit(descriptor->service(i));
+      }
     }
   }
 };
@@ -1069,8 +1103,6 @@ struct VisitImpl {
 // Visit every node in the descriptors calling `visitor(node)`.
 // The visitor does not need to handle all possible node types. Types that are
 // not visitable via `visitor` will be ignored.
-// Disclaimer: this is not fully implemented yet to visit _every_ node.
-// VisitImpl might need to be updated where needs arise.
 template <typename Visitor>
 void VisitDescriptors(const std::vector<const FileDescriptor*>& descriptors,
                       Visitor visitor) {
@@ -1099,7 +1131,171 @@ bool HasReservedFieldNumber(const FieldDescriptor* field) {
 namespace {
 std::unique_ptr<SimpleDescriptorDatabase>
 PopulateSingleSimpleDescriptorDatabase(const std::string& descriptor_set_name);
+
+// Indicates whether the field is compatible with the given target type.
+bool IsFieldCompatible(const FieldDescriptor& field,
+                       FieldOptions::OptionTargetType target_type) {
+  const RepeatedField<int> allowed_targets = field.options().targets();
+  return allowed_targets.empty() ||
+         absl::c_linear_search(allowed_targets, target_type);
 }
+
+// Converts the OptionTargetType enum to a string suitable for use in error
+// messages.
+absl::string_view TargetTypeString(FieldOptions::OptionTargetType target_type) {
+  switch (target_type) {
+    case FieldOptions::TARGET_TYPE_FILE:
+      return "file";
+    case FieldOptions::TARGET_TYPE_EXTENSION_RANGE:
+      return "extension range";
+    case FieldOptions::TARGET_TYPE_MESSAGE:
+      return "message";
+    case FieldOptions::TARGET_TYPE_FIELD:
+      return "field";
+    case FieldOptions::TARGET_TYPE_ONEOF:
+      return "oneof";
+    case FieldOptions::TARGET_TYPE_ENUM:
+      return "enum";
+    case FieldOptions::TARGET_TYPE_ENUM_ENTRY:
+      return "enum entry";
+    case FieldOptions::TARGET_TYPE_SERVICE:
+      return "service";
+    case FieldOptions::TARGET_TYPE_METHOD:
+      return "method";
+    default:
+      return "unknown";
+  }
+}
+
+// Recursively validates that the options message (or subpiece of an options
+// message) is compatible with the given target type.
+bool ValidateTargetConstraintsRecursive(
+    const Message& m, DescriptorPool::ErrorCollector& error_collector,
+    FieldOptions::OptionTargetType target_type) {
+  std::vector<const FieldDescriptor*> fields;
+  const Reflection* reflection = m.GetReflection();
+  reflection->ListFields(m, &fields);
+  bool success = true;
+  for (const auto* field : fields) {
+    if (!IsFieldCompatible(*field, target_type)) {
+      success = false;
+      // DO NOT SUBMIT without fixing this to use the real file name and
+      // element name.
+      error_collector.RecordError(
+          "foo.proto", "Foo", &m, DescriptorPool::ErrorCollector::OPTION_VALUE,
+          absl::StrCat("Option ", field->full_name(),
+                       " cannot be set on an entity of type ",
+                       TargetTypeString(target_type), "."));
+    }
+    if (field->type() == FieldDescriptor::TYPE_MESSAGE) {
+      if (field->is_repeated()) {
+        int field_size = reflection->FieldSize(m, field);
+        for (int i = 0; i < field_size; ++i) {
+          success &= ValidateTargetConstraintsRecursive(
+              reflection->GetRepeatedMessage(m, field, i), error_collector,
+              target_type);
+        }
+      } else {
+        success &= ValidateTargetConstraintsRecursive(
+            reflection->GetMessage(m, field), error_collector, target_type);
+      }
+    }
+  }
+  return success;
+}
+
+// Validates that the options message is correct with respect to target
+// constraints, returning true if successful. This function converts the
+// options message to a DynamicMessage so that we have visibility into custom
+// options.
+bool ValidateTargetConstraints(const Message& options,
+                               const DescriptorPool& pool,
+                               DescriptorPool::ErrorCollector& error_collector,
+                               FieldOptions::OptionTargetType target_type) {
+  const Descriptor* descriptor =
+      pool.FindMessageTypeByName(options.GetTypeName());
+  if (descriptor == nullptr) {
+    // We were unable to find the options message in the descriptor pool. This
+    // implies that the proto files we are working with do not depend on
+    // descriptor.proto, in which case there are no custom options to worry
+    // about. We can therefore skip the use of DynamicMessage.
+    return ValidateTargetConstraintsRecursive(options, error_collector,
+                                              target_type);
+  } else {
+    DynamicMessageFactory factory;
+    std::unique_ptr<Message> dynamic_message(
+        factory.GetPrototype(descriptor)->New());
+    std::string serialized;
+    ABSL_CHECK(options.SerializeToString(&serialized));
+    ABSL_CHECK(dynamic_message->ParseFromString(serialized));
+    return ValidateTargetConstraintsRecursive(*dynamic_message, error_collector,
+                                              target_type);
+  }
+}
+
+// The overloaded GetTargetType() functions below allow us to map from a
+// descriptor type to the associated OptionTargetType enum.
+FieldOptions::OptionTargetType GetTargetType(const FileDescriptor*) {
+  return FieldOptions::TARGET_TYPE_FILE;
+}
+
+FieldOptions::OptionTargetType GetTargetType(
+    const Descriptor::ExtensionRange*) {
+  return FieldOptions::TARGET_TYPE_EXTENSION_RANGE;
+}
+
+FieldOptions::OptionTargetType GetTargetType(const Descriptor*) {
+  return FieldOptions::TARGET_TYPE_MESSAGE;
+}
+
+FieldOptions::OptionTargetType GetTargetType(const FieldDescriptor*) {
+  return FieldOptions::TARGET_TYPE_FIELD;
+}
+
+FieldOptions::OptionTargetType GetTargetType(const OneofDescriptor*) {
+  return FieldOptions::TARGET_TYPE_ONEOF;
+}
+
+FieldOptions::OptionTargetType GetTargetType(const EnumDescriptor*) {
+  return FieldOptions::TARGET_TYPE_ENUM;
+}
+
+FieldOptions::OptionTargetType GetTargetType(const EnumValueDescriptor*) {
+  return FieldOptions::TARGET_TYPE_ENUM_ENTRY;
+}
+
+FieldOptions::OptionTargetType GetTargetType(const ServiceDescriptor*) {
+  return FieldOptions::TARGET_TYPE_SERVICE;
+}
+
+FieldOptions::OptionTargetType GetTargetType(const MethodDescriptor*) {
+  return FieldOptions::TARGET_TYPE_METHOD;
+}
+
+// Visitor class for validating target constraints.
+class TargetConstraintVisitor {
+ public:
+  TargetConstraintVisitor(DescriptorPool::ErrorCollector* error_collector,
+                          const DescriptorPool* pool, bool* validation_error)
+      : error_collector_(error_collector),
+        pool_(pool),
+        validation_error_(validation_error) {}
+
+  template <typename DescriptorType>
+  void operator()(const DescriptorType* descriptor) {
+    if (!ValidateTargetConstraints(descriptor->options(), *pool_,
+                                   *error_collector_,
+                                   GetTargetType(descriptor))) {
+      *validation_error_ = true;
+    }
+  }
+
+ private:
+  DescriptorPool::ErrorCollector* const error_collector_;
+  const DescriptorPool* const pool_;
+  bool* const validation_error_;
+};
+}  // namespace
 
 int CommandLineInterface::Run(int argc, const char* const argv[]) {
   Clear();
@@ -1214,6 +1410,10 @@ int CommandLineInterface::Run(int argc, const char* const argv[]) {
                         DescriptorPool::ErrorCollector::NUMBER, error);
     }
   });
+
+  VisitDescriptors(parsed_files, TargetConstraintVisitor(error_collector.get(),
+                                                         descriptor_pool.get(),
+                                                         &validation_error));
 
 
   if (validation_error) {
