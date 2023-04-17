@@ -50,6 +50,6 @@ def aarch64_test(**kwargs):
 def x86_64_test(**kwargs):
     _arch_test_impl(
         platform = "x86_64",
-        file_platform = "ELF 64-bit LSB.*, ARM x86_64",
+        file_platform = "x86.64",
         **kwargs
     )
