@@ -496,6 +496,7 @@ message TestNestedRequiredForeign {
   optional TestNestedRequiredForeign child = 1;
   optional TestRequiredForeign payload = 2;
   optional int32 dummy = 3;
+  optional TestNestedRequiredForeign lazy_child = 4 [lazy = true];
 }
 
 // Test that we can use NestedMessage from outside TestAllTypes.
