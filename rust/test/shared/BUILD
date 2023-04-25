@@ -141,3 +141,23 @@ rust_test(
     ],
     deps = ["//rust/test:unittest_upb_rust_proto"],
 )
+
+rust_test(
+    name = "serialization_upb_test",
+    srcs = ["serialization_test.rs"],
+    tags = [
+        # TODO(b/270274576): Enable testing on arm once we have a Rust Arm toolchain.
+        "not_build:arm",
+    ],
+    deps = ["//rust/test:unittest_upb_rust_proto"],
+)
+
+rust_test(
+    name = "serialization_cpp_test",
+    srcs = ["serialization_test.rs"],
+    tags = [
+        # TODO(b/270274576): Enable testing on arm once we have a Rust Arm toolchain.
+        "not_build:arm",
+    ],
+    deps = ["//rust/test:unittest_cc_rust_proto"],
+)
